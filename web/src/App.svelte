@@ -3,7 +3,10 @@
   import { useRegisterSW } from 'virtual:pwa-register/svelte'
 
   import { detectFaceSnapshot, getFaceDetector, getPerformanceProfile, stopMediaStream } from './lib/faceDetector'
+  import { readOfflineReadyFlag, writeOfflineReadyFlag } from './lib/offlineReadiness'
+  import { formatDate, formatDuration, modeLabel } from './lib/sessionView'
   import { clearTrainingData, getPersonalRecord, listSessions, saveSession } from './lib/storage'
+  import { classifyStartupError, type StartupStage } from './lib/startupErrors'
   import { nextSessionState } from './lib/sessionMachine'
   import type { ChallengeType, SessionMode, SessionRecord, SessionState } from './lib/types'
 
@@ -13,7 +16,6 @@
   const DETECTION_LOSS_GUARD_MS = 500
   const START_COUNTDOWN_SECONDS = 3
   const LOSS_COUNTDOWN_SECONDS = 5
-  const FIRST_LOAD_KEY = 'plank:first-load-complete'
 
   const presetOptions = [30, 60, 90, 120]
 
@@ -30,6 +32,8 @@
 
   let isOffline = !navigator.onLine
   let firstOpenOffline = false
+  let offlineReadyPersisted = false
+  let offlineCachePending = false
   let offlineReady = false
   let needRefresh = false
 
@@ -73,12 +77,15 @@
       needRefresh = true
     },
     onOfflineReady() {
-      offlineReady = true
-      localStorage.setItem(FIRST_LOAD_KEY, '1')
+      offlineReadyPersisted = true
+      offlineCachePending = false
+      writeOfflineReadyFlag()
     },
   })
 
-  $: offlineReady = $offlineReadyStore
+  $: offlineReady = $offlineReadyStore || offlineReadyPersisted
+  $: firstOpenOffline = isOffline && !offlineReady
+  $: if (offlineReady) offlineCachePending = false
   $: needRefresh = $needRefreshStore
 
   $: canStart = sessionState === 'idle' || sessionState === 'done'
@@ -91,39 +98,17 @@
   $: countdownLabel =
     countdownPhase === 'start' ? 'Timer mulai dalam' : countdownPhase === 'loss' ? 'Timer lanjut dalam' : ''
 
-  function formatDuration(totalMs: number): string {
-    const totalSeconds = Math.floor(totalMs / 1000)
-    const minutes = Math.floor(totalSeconds / 60)
-    const seconds = totalSeconds % 60
-    const centiseconds = Math.floor((totalMs % 1000) / 10)
-
-    return `${String(minutes).padStart(2, '0')}:${String(seconds).padStart(2, '0')}.${String(centiseconds).padStart(2, '0')}`
-  }
-
-  function formatDate(isoDate: string): string {
-    const date = new Date(isoDate)
-    return date.toLocaleString('id-ID', {
-      day: '2-digit',
-      month: 'short',
-      hour: '2-digit',
-      minute: '2-digit',
-    })
-  }
-
-  function modeLabel(selectedMode: SessionMode): string {
-    if (selectedMode === 'practice') {
-      return 'Practice'
-    }
-
-    if (selectedMode === 'challenge') {
-      return 'Challenge'
-    }
-
-    return 'Manual'
-  }
-
   function transition(event: Parameters<typeof nextSessionState>[1]): void {
     sessionState = nextSessionState(sessionState, event, { mode })
+  }
+
+  function stopDetectorLoop(): void {
+    if (detectorInterval) {
+      clearInterval(detectorInterval)
+      detectorInterval = null
+    }
+
+    detectorBusy = false
   }
 
   function clearIntervals(): void {
@@ -140,10 +125,7 @@
     countdownPhase = 'none'
     countdownValue = 0
 
-    if (detectorInterval) {
-      clearInterval(detectorInterval)
-      detectorInterval = null
-    }
+    stopDetectorLoop()
   }
 
   function resetRuntimeForNewSession(): void {
@@ -172,6 +154,8 @@
   }
 
   function closeCamera(): void {
+    stopDetectorLoop()
+
     stopMediaStream(cameraStream)
     cameraStream = null
 
@@ -421,6 +405,68 @@
     }, detectorIntervalMs)
   }
 
+  function resetDetectionRuntime(): void {
+    detectorBootAt = 0
+    stableFrames = 0
+    lossStartedAt = 0
+    pendingPauseDeadlineMs = 0
+    hadQualityWarning = false
+  }
+
+  function handleStartupFailure(error: unknown, stage: StartupStage): void {
+    clearIntervals()
+    closeCamera()
+    resetDetectionRuntime()
+
+    if (sessionState === 'detecting') {
+      transition('detection-timeout')
+    }
+
+    const failureType = classifyStartupError(error, stage)
+
+    if (failureType === 'permission') {
+      permissionModal = 'denied'
+      statusText = 'Izin kamera ditolak. Aktifkan izin kamera lalu coba lagi.'
+      warningText = ''
+      return
+    }
+
+    if (failureType === 'camera') {
+      permissionModal = 'revoked'
+      statusText = 'Kamera tidak tersedia saat ini. Periksa izin atau perangkat kamera.'
+      warningText = 'Anda bisa lanjutkan sesi dengan Manual mode.'
+      return
+    }
+
+    permissionModal = null
+
+    if (failureType === 'detector') {
+      statusText = 'Inisialisasi deteksi wajah gagal.'
+      warningText = 'Coba lagi beberapa saat, atau lanjutkan dengan Manual mode.'
+      return
+    }
+
+    statusText = 'Sesi gagal dimulai karena gangguan tak terduga.'
+    warningText = 'Silakan coba lagi.'
+  }
+
+  function handleResumeFailure(error: unknown): void {
+    clearCountdown()
+    closeCamera()
+
+    const failureType = classifyStartupError(error, 'resume')
+    if (failureType === 'permission' || failureType === 'camera') {
+      permissionModal = 'revoked'
+      statusText = 'Akses kamera tidak tersedia. Lanjutkan manual atau akhiri sesi.'
+      warningText = ''
+      return
+    }
+
+    permissionModal = null
+    statusText = 'Deteksi wajah belum bisa dilanjutkan saat ini.'
+    warningText = 'Coba Resume lagi, atau gunakan Manual mode.'
+  }
+
   async function startSession(): Promise<void> {
     if (firstOpenOffline) {
       statusText = 'Load awal butuh koneksi internet. Buka lagi saat online.'
@@ -445,14 +491,20 @@
 
     try {
       await ensureCamera()
-      transition('start-camera')
-      detectorBootAt = Date.now()
-      stableFrames = 0
-      statusText = 'Mencari wajah...'
+    } catch (error) {
+      handleStartupFailure(error, 'camera')
+      return
+    }
+
+    transition('start-camera')
+    detectorBootAt = Date.now()
+    stableFrames = 0
+    statusText = 'Mencari wajah...'
+
+    try {
       await startDetectionLoop()
-    } catch {
-      permissionModal = 'denied'
-      statusText = 'Izin kamera belum diberikan.'
+    } catch (error) {
+      handleStartupFailure(error, 'detector')
     }
   }
 
@@ -465,9 +517,8 @@
       try {
         await ensureCamera()
         await startDetectionLoop()
-      } catch {
-        permissionModal = 'revoked'
-        statusText = 'Akses kamera tidak tersedia. Lanjutkan manual atau akhiri sesi.'
+      } catch (error) {
+        handleResumeFailure(error)
         return
       }
     }
@@ -620,17 +671,12 @@
           : 'Perangkat low-end terdeteksi. Detector dijalankan 200ms.'
     }
 
-    const loadedBefore = localStorage.getItem(FIRST_LOAD_KEY) === '1'
-    firstOpenOffline = !loadedBefore && !navigator.onLine
-
-    if (navigator.onLine) {
-      localStorage.setItem(FIRST_LOAD_KEY, '1')
-    }
+    offlineReadyPersisted = readOfflineReadyFlag()
+    offlineCachePending = navigator.onLine && !offlineReadyPersisted
 
     const onOnline = (): void => {
       isOffline = false
-      firstOpenOffline = false
-      localStorage.setItem(FIRST_LOAD_KEY, '1')
+      offlineCachePending = !offlineReady
     }
 
     const onOffline = (): void => {
@@ -672,6 +718,12 @@
   {#if isOffline}
     <section class="banner info">
       <p>Offline mode aktif. Data sesi tetap disimpan lokal di device.</p>
+    </section>
+  {/if}
+
+  {#if !isOffline && offlineCachePending && !offlineReady}
+    <section class="banner info">
+      <p>Online terdeteksi. Menyiapkan cache offline pertama kali...</p>
     </section>
   {/if}
 

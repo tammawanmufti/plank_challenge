@@ -3,8 +3,9 @@ import { FaceDetector, FilesetResolver } from '@mediapipe/tasks-vision'
 import type { DetectorSnapshot } from './types'
 
 const WASM_BASE_URL = 'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.34/wasm'
+// Use an immutable model path to keep detector behavior reproducible across releases.
 const MODEL_URL =
-  'https://storage.googleapis.com/mediapipe-models/face_detector/blaze_face_short_range/float16/latest/blaze_face_short_range.tflite'
+  'https://storage.googleapis.com/mediapipe-models/face_detector/blaze_face_short_range/float16/1/blaze_face_short_range.tflite'
 
 let detectorPromise: Promise<FaceDetector> | null = null
 
@@ -88,15 +89,29 @@ export async function getFaceDetector(): Promise<FaceDetector> {
     detectorPromise = (async () => {
       const resolver = await FilesetResolver.forVisionTasks(WASM_BASE_URL)
 
-      return FaceDetector.createFromOptions(resolver, {
-        baseOptions: {
-          modelAssetPath: MODEL_URL,
-          delegate: 'GPU',
-        },
-        runningMode: 'VIDEO',
-        minDetectionConfidence: 0.6,
-      })
-    })()
+      try {
+        return await FaceDetector.createFromOptions(resolver, {
+          baseOptions: {
+            modelAssetPath: MODEL_URL,
+            delegate: 'GPU',
+          },
+          runningMode: 'VIDEO',
+          minDetectionConfidence: 0.6,
+        })
+      } catch {
+        return FaceDetector.createFromOptions(resolver, {
+          baseOptions: {
+            modelAssetPath: MODEL_URL,
+            delegate: 'CPU',
+          },
+          runningMode: 'VIDEO',
+          minDetectionConfidence: 0.6,
+        })
+      }
+    })().catch((error) => {
+      detectorPromise = null
+      throw error
+    })
   }
 
   return detectorPromise
