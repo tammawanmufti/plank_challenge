@@ -6,7 +6,7 @@
   import { readOfflineReadyFlag, writeOfflineReadyFlag } from './lib/offlineReadiness'
   import { formatDate, formatDuration, modeLabel } from './lib/sessionView'
   import { clearTrainingData, getPersonalRecord, listSessions, saveSession } from './lib/storage'
-  import { classifyStartupError, type StartupStage } from './lib/startupErrors'
+  import { classifyStartupError, isCameraContextSecure, type StartupStage } from './lib/startupErrors'
   import { nextSessionState } from './lib/sessionMachine'
   import type { ChallengeType, SessionMode, SessionRecord, SessionState } from './lib/types'
 
@@ -28,7 +28,7 @@
   let warningText = ''
   let settingsMessage = ''
   let performanceMessage = ''
-  let permissionModal: 'denied' | 'revoked' | null = null
+  let permissionModal: 'denied' | 'revoked' | 'insecure' | null = null
 
   let isOffline = !navigator.onLine
   let firstOpenOffline = false
@@ -424,6 +424,13 @@
 
     const failureType = classifyStartupError(error, stage)
 
+    if (failureType === 'insecure-context') {
+      permissionModal = 'insecure'
+      statusText = 'Kamera membutuhkan koneksi aman (HTTPS atau localhost).'
+      warningText = 'Buka app lewat HTTPS atau lanjutkan dengan Manual mode.'
+      return
+    }
+
     if (failureType === 'permission') {
       permissionModal = 'denied'
       statusText = 'Izin kamera ditolak. Aktifkan izin kamera lalu coba lagi.'
@@ -455,6 +462,13 @@
     closeCamera()
 
     const failureType = classifyStartupError(error, 'resume')
+    if (failureType === 'insecure-context') {
+      permissionModal = 'insecure'
+      statusText = 'Resume kamera butuh koneksi aman (HTTPS atau localhost).'
+      warningText = 'Gunakan HTTPS atau lanjutkan Manual mode.'
+      return
+    }
+
     if (failureType === 'permission' || failureType === 'camera') {
       permissionModal = 'revoked'
       statusText = 'Akses kamera tidak tersedia. Lanjutkan manual atau akhiri sesi.'
@@ -487,6 +501,13 @@
       return
     }
 
+    if (!isCameraContextSecure()) {
+      permissionModal = 'insecure'
+      statusText = 'Kamera membutuhkan koneksi aman (HTTPS atau localhost).'
+      warningText = 'Buka app lewat HTTPS atau lanjutkan dengan Manual mode.'
+      return
+    }
+
     statusText = 'Meminta izin kamera...'
 
     try {
@@ -514,6 +535,13 @@
     }
 
     if (mode !== 'manual' && !cameraStream) {
+      if (!isCameraContextSecure()) {
+        permissionModal = 'insecure'
+        statusText = 'Resume kamera butuh koneksi aman (HTTPS atau localhost).'
+        warningText = 'Gunakan HTTPS atau lanjutkan Manual mode.'
+        return
+      }
+
       try {
         await ensureCamera()
         await startDetectionLoop()
@@ -880,11 +908,19 @@
   {#if permissionModal}
     <section class="modal-layer" role="dialog" aria-modal="true">
       <div class="modal">
-        <h3>{permissionModal === 'denied' ? 'Izin kamera ditolak' : 'Akses kamera dicabut'}</h3>
+        <h3>
+          {permissionModal === 'denied'
+            ? 'Izin kamera ditolak'
+            : permissionModal === 'insecure'
+              ? 'Kamera membutuhkan koneksi aman'
+              : 'Akses kamera dicabut'}
+        </h3>
         <p>
           {permissionModal === 'denied'
             ? 'Anda bisa coba lagi atau langsung lanjut Manual mode.'
-            : 'Sesi bisa dilanjutkan di Manual mode atau diakhiri sekarang.'}
+            : permissionModal === 'insecure'
+              ? 'Buka aplikasi dengan HTTPS atau localhost untuk memakai kamera. Anda tetap bisa lanjut dengan Manual mode.'
+              : 'Sesi bisa dilanjutkan di Manual mode atau diakhiri sekarang.'}
         </p>
         <div class="modal-actions">
           <button on:click={retryCameraFlow}>Retry camera</button>
